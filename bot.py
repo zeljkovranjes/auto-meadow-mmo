@@ -278,29 +278,28 @@ class Bot:
         log.obstacle("Obstacle detected — out of resources — circumventing")
         self.ctrl.update_status('OBSTACLE', 'out of resources')
 
-        btn = self.vision.find(gray, 'out_of_resources_btn')
-        if btn:
-            log.info("OBSTACLE", "Dismiss button found — clicking")
-            self.ctrl.click(btn[0], btn[1])
-        else:
-            log.info("OBSTACLE", "No dismiss button — clicking neutral area")
-            # Use a neutral spot based on last capture size
-            h, w = gray.shape[:2]
-            self.ctrl.click(w // 4, h // 4)
-
+        # Step 1 — Escape key (most reliable with CDP)
+        log.info("OBSTACLE", "Pressing Escape")
+        self.ctrl.press_key('esc')
         time.sleep(cfg.OOR_DISMISS_WAIT)
-
         _, gray = self.vision.capture()
 
+        # Step 2 — click dismiss button if still visible
         if self.vision.find(gray, 'out_of_resources'):
-            log.info("OBSTACLE", "Still visible — retrying with neutral click")
-            h, w = gray.shape[:2]
-            self.ctrl.click(w // 4, h // 4)
+            btn = self.vision.find(gray, 'out_of_resources_btn')
+            if btn:
+                log.info("OBSTACLE", "Still visible — clicking dismiss button")
+                self.ctrl.click(btn[0], btn[1])
+            else:
+                log.info("OBSTACLE", "Still visible — clicking neutral area")
+                h, w = gray.shape[:2]
+                self.ctrl.click(w // 4, h // 4)
             time.sleep(cfg.OOR_NEUTRAL_CLICK_WAIT)
             _, gray = self.vision.capture()
 
+        # Step 3 — try Escape again
         if self.vision.find(gray, 'out_of_resources'):
-            log.info("OBSTACLE", "Fallback — sending Escape key")
+            log.info("OBSTACLE", "Still visible — pressing Escape again")
             self.ctrl.press_key('esc')
             time.sleep(cfg.OOR_ESCAPE_WAIT)
 
