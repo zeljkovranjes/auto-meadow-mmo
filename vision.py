@@ -1,12 +1,14 @@
 import os
 import cv2
 import numpy as np
-import win32gui
-import win32ui
+import json
+import base64
+import requests
+import websocket
 import config as cfg
 import logger as log
 
-_SRCCOPY = 0x00CC0020
+_CDP_PORT = 9222
 
 class GameVision:
     _TEMPLATES = {
@@ -39,7 +41,10 @@ class GameVision:
     def __init__(self):
         self.templates: dict[str, np.ndarray] = {}
         self.arrow_templates: dict[str, np.ndarray] = {}
-        self._scale = 1.0  # detected at calibration
+        self._scale = 1.0
+        self._cdp_ws = None
+        self._cdp_id = 0
+        self._connect_cdp()
         self._load_templates()
         self._extract_arrow_templates()
 
@@ -134,38 +139,56 @@ class GameVision:
             return None
         return cv2.resize(tmpl, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # ── Capture (BitBlt — works when window is behind others) ───────────
+    # ── CDP connection ──────────────────────────────────────────────────
 
-    def capture(self, hwnd: int) -> tuple[np.ndarray, np.ndarray]:
-        """Capture the window's client area via BitBlt. Works even when the
-        window is behind other windows on the same desktop."""
-        left, top, right, bottom = win32gui.GetClientRect(hwnd)
-        w = right - left
-        h = bottom - top
-        if w <= 0 or h <= 0:
+    def _connect_cdp(self):
+        try:
+            r = requests.get(f'http://localhost:{_CDP_PORT}/json', timeout=5)
+            pages = r.json()
+            page = next(p for p in pages if p.get('type') == 'page')
+            self._cdp_ws = websocket.create_connection(page['webSocketDebuggerUrl'])
+        except Exception:
+            self._cdp_ws = None
+
+    def _cdp_send(self, method: str, params: dict = None):
+        if not self._cdp_ws:
+            self._connect_cdp()
+        if not self._cdp_ws:
+            return None
+        self._cdp_id += 1
+        msg_id = self._cdp_id
+        msg = {'id': msg_id, 'method': method, 'params': params or {}}
+        try:
+            self._cdp_ws.settimeout(5)
+            self._cdp_ws.send(json.dumps(msg))
+            # Loop until we get OUR response (skip async CDP events)
+            for _ in range(50):
+                data = json.loads(self._cdp_ws.recv())
+                if data.get('id') == msg_id:
+                    return data
+                # else it's an event — discard and keep reading
+            return None
+        except Exception:
+            log.warn("CDP vision connection lost -- reconnecting")
+            self._cdp_ws = None
+            self._connect_cdp()
+            return None
+
+    # ── Capture (CDP screenshot — fully background) ──────────────────
+
+    def capture(self, _hwnd=None) -> tuple[np.ndarray, np.ndarray]:
+        """Capture Discord via CDP screenshot. Works on any desktop,
+        minimized, or behind other windows."""
+        result = self._cdp_send('Page.captureScreenshot', {'format': 'jpeg', 'quality': 80})
+        if not result or 'result' not in result:
             empty = np.zeros((1, 1, 3), dtype=np.uint8)
             return empty, empty[:, :, 0]
 
-        hwnd_dc = win32gui.GetDC(hwnd)
-        mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
-        save_dc = mfc_dc.CreateCompatibleDC()
-        bmp     = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(mfc_dc, w, h)
-        save_dc.SelectObject(bmp)
-
-        save_dc.BitBlt((0, 0), (w, h), mfc_dc, (0, 0), _SRCCOPY)
-
-        raw = np.frombuffer(bmp.GetBitmapBits(True), dtype=np.uint8)
-        raw = raw.reshape((h, w, 4))  # BGRA
-
-        # Cleanup — must release every frame to avoid GDI handle leaks
-        save_dc.DeleteDC()
-        mfc_dc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hwnd_dc)
-        win32gui.DeleteObject(bmp.GetHandle())
-
-        color = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
-        gray  = cv2.cvtColor(raw, cv2.COLOR_BGRA2GRAY)
+        data = result['result'].get('data', '')
+        img_bytes = base64.b64decode(data)
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        color = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
         return color, gray
 
     # ── Template matching (single-pass, uses pre-scaled templates) ────────
@@ -301,23 +324,35 @@ class GameVision:
 
     def closest_fireball_x(self, color: np.ndarray) -> int | None:
         """
-        Detect all green fireballs and return the X center of the one
-        closest to the bottom of the frame (highest Y). Returns None if
-        no fireballs found.
+        Detect all green fireballs. Uses a weighted score that prioritizes
+        fireballs closest to the bottom (most urgent) but also considers
+        fireballs that are slightly higher if they're more centered.
+        Returns X of the most urgent fireball, or None.
         """
         hsv  = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self._GREEN_LOW, self._GREEN_HIGH)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
-        best_bottom, best_x = -1, None
+
+        fireballs = []
         for cnt in contours:
             if cv2.contourArea(cnt) < cfg.FIREBALL_MIN_AREA:
                 continue
             x, y, w, h = cv2.boundingRect(cnt)
-            bottom = y + h
-            if bottom > best_bottom:
-                best_bottom = bottom
-                best_x = x + w // 2
+            fireballs.append((x + w // 2, y + h))  # (center_x, bottom_y)
 
-        return best_x
+        if not fireballs:
+            return None
+
+        # Sort by bottom Y descending — most urgent first
+        fireballs.sort(key=lambda f: f[1], reverse=True)
+
+        # If top fireball is in the bottom 40% of the screen, it's urgent
+        img_h = color.shape[0]
+        urgent_zone = img_h * 0.6
+
+        # Return the lowest fireball, but if there's one very close behind
+        # (within 15% of screen height), prefer the one more to the side
+        # we're already near (reduces back-and-forth)
+        return fireballs[0][0]

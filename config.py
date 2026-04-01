@@ -11,10 +11,10 @@ Defaults shown are the recommended settings.
 MAIN_LOOP_INTERVAL       = 0.05       # 50 ms  (recommended)
 
 # Battle inner-loop interval — lower = smoother tracking, higher = less CPU
-BATTLE_LOOP_INTERVAL     = 0.003      # 3 ms   (recommended)
+BATTLE_LOOP_INTERVAL     = 0.001      # 1 ms   (recommended)
 
 # Adventure click interval — time between each auto-click
-ADVENTURE_CLICK_INTERVAL = 0.045      # 45 ms  (recommended)
+ADVENTURE_CLICK_INTERVAL = 0.02       # 20 ms  (recommended)
 
 # Craft arrow key delay — time between pressing each arrow key
 CRAFT_ARROW_DELAY        = 0.75       # 750 ms (recommended)

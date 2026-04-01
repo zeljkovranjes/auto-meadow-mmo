@@ -1,17 +1,19 @@
 """
-Meadow MMO Discord Bot — Background Mode
-==========================================
-Runs fully in the background via PrintWindow + PostMessage.
+Meadow MMO Discord Bot — CDP Mode
+===================================
+Runs fully in the background via Chrome DevTools Protocol.
 No cursor movement, no window focus required.
-Works across Windows virtual desktops.
+Works across virtual desktops, minimized, behind other windows.
 
 Priority:  Craft (available) > Battle (available) > Adventure (fallback)
 Press F at any time to stop the bot.
+
+Requires Discord launched with:
+  --remote-debugging-port=9222 --remote-allow-origins=*
 """
 
 import time
 import threading
-import win32gui
 from enum import Enum, auto
 from pynput import keyboard as pkb
 
@@ -31,49 +33,31 @@ class State(Enum):
 class Bot:
     def __init__(self):
         self.vision = GameVision()
-        self.ctrl: GameController | None = None
+        self.ctrl   = GameController()
         self.state  = State.IDLE
 
         self.craft_round    = 0
-        self.battle_btn_pos: tuple | None = None
 
         self._idle_frames = 0
         self._stop = threading.Event()
-        self._hwnd: int | None = None
-        self._last_win_size: tuple[int, int] = (0, 0)
 
     # ── Stop key ─────────────────────────────────────────────────────────
 
     def _start_hotkey(self):
         def on_press(key):
             try:
-                if key.char and key.char.lower() == 'f':
-                    log.separator()
-                    log.system("Kill signal received — shutting down")
-                    self._stop.set()
-                    return False
+                if hasattr(key, 'char') and key.char and key.char.lower() == 'f':
+                    # Only stop on F5 or Ctrl+F to avoid accidental triggers
+                    pass
             except AttributeError:
                 pass
+            # Use F6 as the kill key — unlikely to be pressed accidentally
+            if key == pkb.Key.f6:
+                log.separator()
+                log.system("Kill signal received (F6) — shutting down")
+                self._stop.set()
+                return False
         pkb.Listener(on_press=on_press, daemon=True).start()
-
-    # ── Discord window ────────────────────────────────────────────────────
-
-    def _refresh_window(self):
-        found = []
-        def cb(hwnd, _):
-            if 'Discord' in win32gui.GetWindowText(hwnd):
-                found.append(hwnd)
-        win32gui.EnumWindows(cb, None)
-        if found:
-            self._hwnd = found[0]
-            self.ctrl = GameController(self._hwnd)
-
-    def _client_size(self) -> tuple[int, int]:
-        """Return (width, height) of the Discord client area."""
-        if not self._hwnd:
-            return (0, 0)
-        r = win32gui.GetClientRect(self._hwnd)
-        return (r[2] - r[0], r[3] - r[1])
 
     # ── Main loop ─────────────────────────────────────────────────────────
 
@@ -83,51 +67,45 @@ class Bot:
         log.system("Initializing modules")
         log.info("SYS", f"Vision engine loaded — {len(self.vision.templates)} templates")
         log.info("SYS", f"Arrow templates — {len(self.vision.arrow_templates)}/4 loaded")
-        log.info("SYS", "Controller ready (background mode)")
+        log.info("SYS", "Controller ready (CDP mode — fully background)")
         log.separator()
 
-        log.system(f"Starting in {cfg.STARTUP_DELAY}s — press F to abort")
+        log.system(f"Starting in {cfg.STARTUP_DELAY}s — press F6 to stop")
         self._start_hotkey()
         time.sleep(cfg.STARTUP_DELAY)
 
-        log.system("Acquiring Discord window")
-        self._refresh_window()
-        if self._hwnd:
-            log.success(f"Discord window acquired (hwnd: {self._hwnd})")
-        else:
-            log.warn("Discord window not found — will retry")
-        time.sleep(cfg.WINDOW_SETTLE_DELAY)
+        # Calibrate template scale
+        log.system("Calibrating templates to screen")
+        _, gray = self.vision.capture()
+        self.vision.calibrate(gray)
+        self._last_capture_size = gray.shape[:2]
 
-        # Calibrate template scale to current window size
-        if self._hwnd:
-            log.system("Calibrating templates to screen")
-            _, gray = self.vision.capture(self._hwnd)
-            self.vision.calibrate(gray)
-            self._last_win_size = self._client_size()
+        # Inject status overlay into Discord
+        self.ctrl.inject_overlay()
 
         log.separator()
         log.system("Bot is now running")
         log.separator()
 
         while not self._stop.is_set():
-            if not self._hwnd:
-                log.warn("Discord window lost — retrying")
-                time.sleep(cfg.WINDOW_RETRY_DELAY)
-                self._refresh_window()
-                continue
-
-            color, gray = self.vision.capture(self._hwnd)
+            color, gray = self.vision.capture()
 
             # Re-calibrate if window was resized
-            cur_size = self._client_size()
-            if cur_size != self._last_win_size and cur_size[0] > 0:
-                log.system(f"Window resized to {cur_size[0]}x{cur_size[1]} — recalibrating")
+            cur_size = gray.shape[:2]
+            if cur_size != self._last_capture_size and cur_size[0] > 1:
+                log.system(f"Window resized — recalibrating")
                 self.vision.recalibrate(gray)
-                self._last_win_size = cur_size
+                self._last_capture_size = cur_size
 
-            self._tick(gray, color)
+            try:
+                self._tick(gray, color)
+            except Exception as e:
+                log.error(f"Tick error: {e} — recovering")
+                self.state = State.IDLE
+                time.sleep(1)
             time.sleep(cfg.MAIN_LOOP_INTERVAL)
 
+        self.ctrl.update_status('IDLE', 'stopped')
         log.separator()
         log.system("Bot stopped — session ended")
         log.separator()
@@ -147,15 +125,12 @@ class Bot:
         craft_visible  = self.vision.find(gray, 'craft_btn',  cfg.THRESH_CRAFT_BTN) is not None
         battle_visible = self.vision.find(gray, 'battle_btn', cfg.THRESH_BATTLE_BTN) is not None
 
-        cd_pos = self.vision.find(gray, 'cooldown_clock')
-        if cd_pos:
-            self.battle_btn_pos = cd_pos
-
         if craft_avail and self.state != State.CRAFT:
             self._idle_frames = 0
             log.state_change(self.state.name, "CRAFT")
             self.state = State.CRAFT
             self.craft_round = 0
+            self.ctrl.update_status('CRAFT', 'entering game')
 
         elif (not craft_avail
               and battle_avail
@@ -163,6 +138,7 @@ class Bot:
             self._idle_frames = 0
             log.state_change(self.state.name, "BATTLE")
             self.state = State.BATTLE
+            self.ctrl.update_status('BATTLE', 'entering game')
 
         elif not craft_visible and not battle_visible:
             adv_visible = (
@@ -189,16 +165,19 @@ class Bot:
                 log.state_change("IDLE", "ADVENTURE")
                 self.state = State.ADVENTURE
                 self._idle_frames = 0
+                self.ctrl.update_status('ADVENTURE', 'clicking')
             return
 
         if self.state == State.CRAFT and self.vision.is_craft_on_cooldown(gray):
             log.cooldown("Craft")
             self.state = State.IDLE
+            self.ctrl.update_status('IDLE', 'craft on cooldown')
             return
 
         if self.state == State.BATTLE and self.vision.is_battle_on_cooldown(gray):
             log.cooldown("Battle")
             self.state = State.IDLE
+            self.ctrl.update_status('IDLE', 'battle on cooldown')
             return
 
         if self.state == State.ADVENTURE:
@@ -217,8 +196,6 @@ class Bot:
         if pos is None:
             return
 
-        self.ctrl.grab_focus()
-        self.ctrl.move(pos[0], pos[1])
         log.action("ADV", f"Engaging adventure at ({pos[0]}, {pos[1]})")
 
         frame_count = 0
@@ -228,73 +205,68 @@ class Bot:
 
             frame_count += 1
             if frame_count % cfg.ADVENTURE_CHECK_EVERY == 0:
-                _, gray = self.vision.capture(self._hwnd)
+                _, gray = self.vision.capture()
 
                 if self.vision.find(gray, 'out_of_resources'):
                     self._dismiss_out_of_resources(gray)
                     self.state = State.IDLE
-                    self.ctrl.release_focus()
                     return
 
                 if self.vision.is_craft_available(gray):
                     log.action("ADV", "Craft available — switching priority")
                     self.state = State.CRAFT
                     self.craft_round = 0
-                    self.ctrl.release_focus()
+                    self.ctrl.update_status('CRAFT', 'entering game')
                     return
 
                 if self.vision.is_battle_available(gray):
                     log.action("ADV", "Battle available — switching priority")
                     self.state = State.BATTLE
-                    self.ctrl.release_focus()
+                    self.ctrl.update_status('BATTLE', 'entering game')
                     return
 
     # ── Craft ─────────────────────────────────────────────────────────────
 
     def _craft(self, gray):
-        self.ctrl.grab_focus()
-
         # Enter craft game
         inside = self.vision.find(gray, 'craft_star_0', thresh=cfg.THRESH_CRAFT_STAR) is not None
         if not inside:
             craft_btn_pos = self.vision.find(gray, 'craft_btn', thresh=cfg.THRESH_CRAFT_BTN)
             if craft_btn_pos:
                 log.action("CRAFT", "Entering craft game")
-                self.ctrl.move(craft_btn_pos[0], craft_btn_pos[1])
-                time.sleep(cfg.PRE_CLICK_DELAY)
                 self.ctrl.click(craft_btn_pos[0], craft_btn_pos[1])
                 time.sleep(cfg.CRAFT_LOAD_DELAY)
-                _, gray = self.vision.capture(self._hwnd)
+                _, gray = self.vision.capture()
 
         log.info("CRAFT", "Craft loop active — awaiting arrows")
 
         while not self._stop.is_set():
-            _, gray = self.vision.capture(self._hwnd)
+            _, gray = self.vision.capture()
 
             if self.vision.find(gray, 'craft_success', thresh=cfg.THRESH_CRAFT_SUCCESS):
                 pos = self.vision.find(gray, 'continue_btn')
                 if pos:
                     log.success("Craft complete — collecting reward")
+                    self.ctrl.update_status('CRAFT', 'complete!')
                     self.ctrl.click(pos[0], pos[1])
                     self.craft_round = 0
                     time.sleep(cfg.POST_GAME_PAUSE)
                 self.state = State.IDLE
-                self.ctrl.release_focus()
                 return
 
             if self.vision.is_craft_on_cooldown(gray):
                 log.cooldown("Craft")
                 self.state = State.IDLE
-                self.ctrl.release_focus()
                 return
 
             arrows = self.vision.detect_arrows(gray)
             if arrows:
                 log.action("CRAFT", f"Round {self.craft_round + 1}/3 — sequence: {' '.join(arrows)}")
+                self.ctrl.update_status('CRAFT', f'round {self.craft_round + 1}/3')
                 for key in arrows:
                     self.ctrl.press_key(key)
                     time.sleep(cfg.CRAFT_ARROW_DELAY)
-                    _, gray = self.vision.capture(self._hwnd)
+                    _, gray = self.vision.capture()
                 self.craft_round += 1
                 time.sleep(cfg.CRAFT_ROUND_PAUSE)
             else:
@@ -304,8 +276,7 @@ class Bot:
 
     def _dismiss_out_of_resources(self, gray):
         log.obstacle("Obstacle detected — out of resources — circumventing")
-
-        win_w, win_h = self._client_size()
+        self.ctrl.update_status('OBSTACLE', 'out of resources')
 
         btn = self.vision.find(gray, 'out_of_resources_btn')
         if btn:
@@ -313,17 +284,20 @@ class Bot:
             self.ctrl.click(btn[0], btn[1])
         else:
             log.info("OBSTACLE", "No dismiss button — clicking neutral area")
-            self.ctrl.click(win_w // 4, win_h // 4)
+            # Use a neutral spot based on last capture size
+            h, w = gray.shape[:2]
+            self.ctrl.click(w // 4, h // 4)
 
         time.sleep(cfg.OOR_DISMISS_WAIT)
 
-        _, gray = self.vision.capture(self._hwnd)
+        _, gray = self.vision.capture()
 
         if self.vision.find(gray, 'out_of_resources'):
             log.info("OBSTACLE", "Still visible — retrying with neutral click")
-            self.ctrl.click(win_w // 4, win_h // 4)
+            h, w = gray.shape[:2]
+            self.ctrl.click(w // 4, h // 4)
             time.sleep(cfg.OOR_NEUTRAL_CLICK_WAIT)
-            _, gray = self.vision.capture(self._hwnd)
+            _, gray = self.vision.capture()
 
         if self.vision.find(gray, 'out_of_resources'):
             log.info("OBSTACLE", "Fallback — sending Escape key")
@@ -335,36 +309,33 @@ class Bot:
     # ── Battle ────────────────────────────────────────────────────────────
 
     def _battle(self, gray, color):
-        self.ctrl.grab_focus()
-
         # Enter battle
         btn = self.vision.find(gray, 'battle_btn', thresh=cfg.THRESH_BATTLE_BTN)
         if btn:
             log.action("BATTLE", "Entering battle game")
-            self.ctrl.move(btn[0], btn[1])
-            time.sleep(cfg.PRE_CLICK_DELAY)
             self.ctrl.click(btn[0], btn[1])
 
             # Poll for the button to disappear (game loaded)
             poll_iters = int(cfg.BATTLE_LOAD_TIMEOUT / cfg.BATTLE_LOAD_POLL)
             for _ in range(poll_iters):
                 time.sleep(cfg.BATTLE_LOAD_POLL)
-                color, gray = self.vision.capture(self._hwnd)
+                color, gray = self.vision.capture()
                 if self.vision.find(gray, 'battle_btn', thresh=cfg.THRESH_BATTLE_BTN) is None:
                     break
 
         # Inside the game
         platform_pos = self.vision.find(gray, 'battle_platform', thresh=cfg.THRESH_BATTLE_PLATFORM)
-        win_w, win_h = self._client_size()
-        platform_y = platform_pos[1] if platform_pos else int(win_h * cfg.PLATFORM_Y_FALLBACK)
-        center_x   = win_w // 2
+        h, w = gray.shape[:2]
+        platform_y = platform_pos[1] if platform_pos else int(h * cfg.PLATFORM_Y_FALLBACK)
+        center_x   = w // 2
         frame_count = 0
 
         self.ctrl.move(center_x, platform_y)
         log.info("BATTLE", "Tracking active — intercepting fireballs")
+        self.ctrl.update_status('BATTLE', 'tracking fireballs')
 
         while not self._stop.is_set():
-            color, gray = self.vision.capture(self._hwnd)
+            color, gray = self.vision.capture()
 
             fireball_x = self.vision.closest_fireball_x(color)
             target_x = fireball_x if fireball_x is not None else center_x
@@ -375,7 +346,6 @@ class Bot:
                 if self.vision.find(gray, 'out_of_resources'):
                     self._dismiss_out_of_resources(gray)
                     self.state = State.IDLE
-                    self.ctrl.release_focus()
                     return
 
                 if self.vision.find(gray, 'battle_success', thresh=cfg.THRESH_BATTLE_SUCCESS):
@@ -383,23 +353,21 @@ class Bot:
                            or self.vision.find(gray, 'back_arrow'))
                     if pos:
                         log.success("Battle won — collecting reward")
+                        self.ctrl.update_status('BATTLE', 'won!')
                         self.ctrl.click(pos[0], pos[1])
                         time.sleep(cfg.POST_GAME_PAUSE)
                     self.state = State.IDLE
-                    self.ctrl.release_focus()
                     return
 
                 if self.vision.is_craft_available(gray):
                     log.action("BATTLE", "Craft available — switching priority")
                     self.state = State.CRAFT
                     self.craft_round = 0
-                    self.ctrl.release_focus()
                     return
 
                 if self.vision.is_battle_on_cooldown(gray):
                     log.cooldown("Battle")
                     self.state = State.IDLE
-                    self.ctrl.release_focus()
                     return
 
             time.sleep(cfg.BATTLE_LOOP_INTERVAL)

@@ -22,12 +22,12 @@ _COLORS = {
 }
 
 _ICONS = {
-    'system':    '⚙',
-    'success':   '✔',
-    'action':    '►',
-    'warn':      '⚠',
-    'error':     '✖',
-    'info':      '│',
+    'system':    '*',
+    'success':   '+',
+    'action':    '>',
+    'warn':      '!',
+    'error':     'x',
+    'info':      '|',
 }
 
 _BRIGHT = Style.BRIGHT
@@ -50,12 +50,12 @@ def _log(level: str, tag: str, msg: str):
 
 def banner():
     b = f"""{Fore.CYAN}{_BRIGHT}
-    ╔══════════════════════════════════════════╗
-    ║         MEADOW MMO  ·  AUTO BOT         ║
-    ║──────────────────────────────────────────║
-    ║  Craft  ›  Battle  ›  Adventure         ║
-    ║  Press F to stop                         ║
-    ╚══════════════════════════════════════════╝{_RESET}"""
+    +==========================================+
+    |         MEADOW MMO  -  AUTO BOT         |
+    |------------------------------------------|
+    |  Craft  >  Battle  >  Adventure         |
+    |  Press F6 to stop                        |
+    +==========================================+{_RESET}"""
     print(b)
 
 
@@ -87,4 +87,4 @@ def cooldown(game: str):
     _log('dim', 'CD', f"{game} on cooldown — skipping")
 
 def separator():
-    print(f"  {Style.DIM}{Fore.CYAN}{'─' * 50}{_RESET}")
+    print(f"  {Style.DIM}{Fore.CYAN}{'-' * 50}{_RESET}")

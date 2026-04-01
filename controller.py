@@ -1,159 +1,164 @@
 """
-Game Controller — Background Mode
-==================================
-Flash-focuses Discord for each input action, then restores your window.
-Fast enough to be invisible on another virtual desktop.
+Game Controller — CDP (Chrome DevTools Protocol)
+=================================================
+Uses JavaScript DOM clicks and CDP keyboard input.
+No real cursor movement. Works fully in background.
+Requires Discord launched with: --remote-debugging-port=9222 --remote-allow-origins=*
 """
 
-import ctypes
-import ctypes.wintypes
+import json
 import time
-import win32gui
-import pynput.keyboard as pkeyboard
+import requests
+import websocket
+import logger as log
 
-_u32 = ctypes.windll.user32
-_kb = pkeyboard.Controller()
+_CDP_PORT = 9222
 
-_PYNPUT_KEY_MAP = {
-    'up':    pkeyboard.Key.up,
-    'down':  pkeyboard.Key.down,
-    'left':  pkeyboard.Key.left,
-    'right': pkeyboard.Key.right,
-    'esc':   pkeyboard.Key.esc,
+_KEY_MAP = {
+    'up':    {'key': 'ArrowUp',    'code': 'ArrowUp',    'vk': 38},
+    'down':  {'key': 'ArrowDown',  'code': 'ArrowDown',  'vk': 40},
+    'left':  {'key': 'ArrowLeft',  'code': 'ArrowLeft',  'vk': 37},
+    'right': {'key': 'ArrowRight', 'code': 'ArrowRight', 'vk': 39},
+    'esc':   {'key': 'Escape',     'code': 'Escape',     'vk': 27},
 }
-
-# ── Win32 constants ──────────────────────────────────────────────────────────
-
-WM_MOUSEMOVE    = 0x0200
-WM_LBUTTONDOWN  = 0x0201
-WM_LBUTTONUP    = 0x0202
-WM_KEYDOWN      = 0x0100
-WM_KEYUP        = 0x0101
-MK_LBUTTON      = 0x0001
-
-_VK_MAP = {
-    'up':    0x26,
-    'down':  0x28,
-    'left':  0x25,
-    'right': 0x27,
-    'esc':   0x1B,
-}
-
-_SCAN_MAP = {
-    'up':    0x48,
-    'down':  0x50,
-    'left':  0x4B,
-    'right': 0x4D,
-    'esc':   0x01,
-}
-
-_EXTENDED = {'up', 'down', 'left', 'right'}
-
-
-def _MAKELPARAM(x, y):
-    return ctypes.wintypes.LPARAM((int(y) << 16) | (int(x) & 0xFFFF))
-
-
-def _find_render_widget(parent_hwnd: int) -> int:
-    """Find Chrome_RenderWidgetHostHWND child window."""
-    result = [None]
-    def cb(hwnd, _):
-        if win32gui.GetClassName(hwnd) == 'Chrome_RenderWidgetHostHWND':
-            result[0] = hwnd
-            return False
-        return True
-    try:
-        win32gui.EnumChildWindows(parent_hwnd, cb, None)
-    except:
-        pass
-    return result[0] or parent_hwnd
 
 
 class GameController:
-    def __init__(self, hwnd: int):
-        self.parent_hwnd = hwnd
-        self.hwnd = _find_render_widget(hwnd)
-        self._locked = False   # True while focus is held for a game session
-        self._prev_fg = None   # window to restore when releasing
+    def __init__(self):
+        self.ws = None
+        self._msg_id = 0
+        self._connect()
 
-    # ── Focus management ─────────────────────────────────────────────────
+    def _connect(self):
+        """Connect to Discord's CDP websocket."""
+        try:
+            r = requests.get(f'http://localhost:{_CDP_PORT}/json', timeout=5)
+            pages = r.json()
+            page = next(p for p in pages if p.get('type') == 'page')
+            self._cdp_ws_url = page['webSocketDebuggerUrl']
+            self.ws = websocket.create_connection(self._cdp_ws_url)
+            log.success(f"CDP connected to: {page.get('title', 'Discord')}")
+        except Exception as e:
+            log.error(f"CDP connection failed: {e}")
+            log.warn("Launch Discord with: --remote-debugging-port=9222 --remote-allow-origins=*")
+            self.ws = None
 
-    def _force_foreground(self):
-        """Force Discord to foreground even when another app has focus.
-        Simulates Alt press to bypass Windows' foreground lock."""
-        _u32.keybd_event(0x12, 0, 0, 0)   # Alt down
-        _u32.keybd_event(0x12, 0, 2, 0)   # Alt up
-        _u32.SetForegroundWindow(self.parent_hwnd)
-
-    def grab_focus(self):
-        """Hold Discord focus until release_focus() is called.
-        Use this for game entry sequences that need sustained focus.
-        Can be called again to re-grab if user switched desktops."""
-        if not self._locked:
-            self._prev_fg = _u32.GetForegroundWindow()
-            if self._prev_fg == self.parent_hwnd:
-                self._prev_fg = None
-        self._force_foreground()
-        time.sleep(0.03)
-        self._locked = True
-
-    def release_focus(self):
-        """Give focus back to whatever the user had open."""
-        if self._locked and self._prev_fg:
-            time.sleep(0.02)
-            _u32.keybd_event(0x12, 0, 0, 0)
-            _u32.keybd_event(0x12, 0, 2, 0)
-            _u32.SetForegroundWindow(self._prev_fg)
-        self._locked = False
-        self._prev_fg = None
-
-    def _flash_focus(self):
-        """Briefly steal focus. If locked, re-grab if focus was lost."""
-        if self._locked:
-            if _u32.GetForegroundWindow() != self.parent_hwnd:
-                self._force_foreground()
-                time.sleep(0.03)
+    def _send(self, method: str, params: dict = None):
+        if not self.ws:
+            self._connect()
+        if not self.ws:
             return None
-        prev = _u32.GetForegroundWindow()
-        if prev != self.parent_hwnd:
-            self._force_foreground()
-            time.sleep(0.03)
-        return prev
+        self._msg_id += 1
+        msg_id = self._msg_id
+        msg = {'id': msg_id, 'method': method, 'params': params or {}}
+        try:
+            self.ws.settimeout(5)
+            self.ws.send(json.dumps(msg))
+            # Loop until we get OUR response (skip async CDP events)
+            for _ in range(50):
+                data = json.loads(self.ws.recv())
+                if data.get('id') == msg_id:
+                    return data
+                # else it's an event — discard and keep reading
+            return None
+        except Exception:
+            log.warn("CDP controller connection lost -- reconnecting")
+            self.ws = None
+            self._connect()
+            return None
 
-    def _restore(self, prev):
-        """Give focus back — skipped if locked."""
-        if self._locked:
-            return
-        if prev and prev != self.parent_hwnd:
-            time.sleep(0.02)
-            _u32.keybd_event(0x12, 0, 0, 0)
-            _u32.keybd_event(0x12, 0, 2, 0)
-            _u32.SetForegroundWindow(prev)
-
-    # ── Input ────────────────────────────────────────────────────────────
+    def _js(self, expression: str):
+        """Execute JavaScript in Discord's page context."""
+        return self._send('Runtime.evaluate', {'expression': expression})
 
     def click(self, x: int, y: int):
-        prev = self._flash_focus()
-        # Convert client coords to screen coords for SetCursorPos
-        pt = ctypes.wintypes.POINT(int(x), int(y))
-        _u32.ClientToScreen(self.parent_hwnd, ctypes.byref(pt))
-        _u32.SetCursorPos(pt.x, pt.y)
-        _u32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFT_DOWN
-        _u32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFT_UP
-        self._restore(prev)
+        """Click via JS elementFromPoint — works even without focus."""
+        self._js(f'''
+            (function() {{
+                var el = document.elementFromPoint({int(x)}, {int(y)});
+                if (el) {{
+                    el.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true, clientX: {int(x)}, clientY: {int(y)}}}));
+                    el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true, button: 0, clientX: {int(x)}, clientY: {int(y)}}}));
+                    el.dispatchEvent(new MouseEvent('mouseup',   {{bubbles: true, button: 0, clientX: {int(x)}, clientY: {int(y)}}}));
+                    el.dispatchEvent(new MouseEvent('click',     {{bubbles: true, button: 0, clientX: {int(x)}, clientY: {int(y)}}}));
+                }}
+            }})()
+        ''')
 
     def move(self, x: int, y: int):
-        prev = self._flash_focus()
-        pt = ctypes.wintypes.POINT(int(x), int(y))
-        _u32.ClientToScreen(self.parent_hwnd, ctypes.byref(pt))
-        _u32.SetCursorPos(pt.x, pt.y)
-        self._restore(prev)
+        """Move via JS mousemove event — for battle tracking."""
+        self._js(f'''
+            (function() {{
+                var el = document.elementFromPoint({int(x)}, {int(y)});
+                if (el) {{
+                    el.dispatchEvent(new MouseEvent('mousemove', {{bubbles: true, clientX: {int(x)}, clientY: {int(y)}}}));
+                }}
+            }})()
+        ''')
 
     def press_key(self, key_name: str):
-        key = _PYNPUT_KEY_MAP.get(key_name)
-        if key is None:
+        """Key press via CDP Input.dispatchKeyEvent."""
+        info = _KEY_MAP.get(key_name)
+        if not info:
             return
-        prev = self._flash_focus()
-        _kb.press(key)
-        _kb.release(key)
-        self._restore(prev)
+        self._send('Input.dispatchKeyEvent', {
+            'type': 'keyDown',
+            'key': info['key'],
+            'code': info['code'],
+            'windowsVirtualKeyCode': info['vk'],
+        })
+        time.sleep(0.01)
+        self._send('Input.dispatchKeyEvent', {
+            'type': 'keyUp',
+            'key': info['key'],
+            'code': info['code'],
+            'windowsVirtualKeyCode': info['vk'],
+        })
+
+    def grab_focus(self):
+        pass
+
+    def release_focus(self):
+        pass
+
+    # ── Status overlay ───────────────────────────────────────────────────
+
+    def inject_overlay(self):
+        """Create a status overlay in Discord's DOM."""
+        self._js('''
+            (function() {
+                if (document.getElementById('bot-overlay')) return;
+                var d = document.createElement('div');
+                d.id = 'bot-overlay';
+                d.style.cssText = 'position:fixed;top:10px;left:10px;z-index:99999;'
+                    + 'background:rgba(0,0,0,0.75);color:#00ff88;padding:8px 14px;'
+                    + 'border-radius:6px;font-family:monospace;font-size:12px;'
+                    + 'pointer-events:none;border:1px solid #00ff8844;'
+                    + 'text-shadow:0 0 4px #00ff8866;';
+                d.innerHTML = '<span style="color:#00ff88">BOT</span> <span id="bot-status" style="color:#aaa">starting...</span>';
+                document.body.appendChild(d);
+            })()
+        ''')
+
+    def update_status(self, state: str, detail: str = ''):
+        """Update the overlay text."""
+        colors = {
+            'IDLE': '#888888',
+            'ADVENTURE': '#ffaa00',
+            'CRAFT': '#00aaff',
+            'BATTLE': '#ff4444',
+            'OBSTACLE': '#ff00ff',
+        }
+        color = colors.get(state, '#00ff88')
+        text = f'{state}' + (f' - {detail}' if detail else '')
+        # Escape quotes for JS
+        text = text.replace("'", "\\'")
+        self._js(f'''
+            (function() {{
+                var el = document.getElementById('bot-status');
+                if (el) {{
+                    el.style.color = '{color}';
+                    el.textContent = '{text}';
+                }}
+            }})()
+        ''')
