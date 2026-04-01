@@ -1,6 +1,6 @@
 # Meadow MMO Auto Bot
 
-An automation bot for the Meadow MMO Discord game. It plays the three mini-games for you on repeat so you can sit back and collect rewards.
+An automation bot for the Meadow MMO Discord game. It plays the three mini-games for you on repeat so you can sit back and touch grass.
 
 ## What It Does
 
