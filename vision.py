@@ -1,9 +1,12 @@
 import os
 import cv2
 import numpy as np
-import mss
+import win32gui
+import win32ui
 import config as cfg
 import logger as log
+
+_SRCCOPY = 0x00CC0020
 
 class GameVision:
     _TEMPLATES = {
@@ -34,7 +37,6 @@ class GameVision:
     _GREEN_HIGH = np.array(cfg.FIREBALL_HSV_HIGH, dtype=np.uint8)
 
     def __init__(self):
-        self.sct = mss.mss()
         self.templates: dict[str, np.ndarray] = {}
         self.arrow_templates: dict[str, np.ndarray] = {}
         self._scale = 1.0  # detected at calibration
@@ -73,7 +75,13 @@ class GameVision:
         if len(self.arrow_templates) < 4:
             log.warn("Not all arrow templates loaded — craft detection may fail")
 
-    # ── Calibration — run once to find the right scale ────────────────────
+    # ── Calibration ────────────────────────────────────────────────────────
+
+    def recalibrate(self, gray: np.ndarray):
+        """Reload original templates from disk and re-run calibration."""
+        self._load_templates()
+        self._extract_arrow_templates()
+        self.calibrate(gray)
 
     def calibrate(self, gray: np.ndarray):
         """Try all scales against a few key templates, lock in the best one."""
@@ -97,14 +105,17 @@ class GameVision:
                 res = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
                 _, val, _, _ = cv2.minMaxLoc(res)
                 total += val
+            log.info("CAL", f"Scale {scale:.1f}x — score: {total:.3f}")
             if total > best_val:
                 best_val = total
                 best_scale = scale
 
         self._scale = best_scale
+        avg_score = best_val / len(test_keys) if test_keys else 0
+        log.system(f"Calibrated scale: {best_scale:.1f}x (avg match: {avg_score:.3f})")
+
+        # Pre-scale all templates so every future match is single-pass
         if best_scale != 1.0:
-            log.system(f"Calibrated scale: {best_scale:.1f}x")
-            # Pre-scale all templates so every future match is single-pass
             for key, tmpl in self.templates.items():
                 scaled = self._resize(tmpl, best_scale)
                 if scaled is not None:
@@ -113,8 +124,6 @@ class GameVision:
                 scaled = self._resize(tmpl, best_scale)
                 if scaled is not None:
                     self.arrow_templates[direction] = scaled
-        else:
-            log.system("Calibrated scale: 1.0x (native)")
 
     def _resize(self, tmpl: np.ndarray, scale: float) -> np.ndarray | None:
         if scale == 1.0:
@@ -125,13 +134,36 @@ class GameVision:
             return None
         return cv2.resize(tmpl, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # ── Capture ───────────────────────────────────────────────────────────
+    # ── Capture (BitBlt — works when window is behind others) ───────────
 
-    def capture(self, rect: tuple) -> tuple[np.ndarray, np.ndarray]:
-        """Return (color_bgr, gray) frames of the given screen rect."""
-        x1, y1, x2, y2 = rect
-        region = {"top": y1, "left": x1, "width": x2 - x1, "height": y2 - y1}
-        raw   = np.array(self.sct.grab(region))
+    def capture(self, hwnd: int) -> tuple[np.ndarray, np.ndarray]:
+        """Capture the window's client area via BitBlt. Works even when the
+        window is behind other windows on the same desktop."""
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        w = right - left
+        h = bottom - top
+        if w <= 0 or h <= 0:
+            empty = np.zeros((1, 1, 3), dtype=np.uint8)
+            return empty, empty[:, :, 0]
+
+        hwnd_dc = win32gui.GetDC(hwnd)
+        mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+        bmp     = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+        save_dc.SelectObject(bmp)
+
+        save_dc.BitBlt((0, 0), (w, h), mfc_dc, (0, 0), _SRCCOPY)
+
+        raw = np.frombuffer(bmp.GetBitmapBits(True), dtype=np.uint8)
+        raw = raw.reshape((h, w, 4))  # BGRA
+
+        # Cleanup — must release every frame to avoid GDI handle leaks
+        save_dc.DeleteDC()
+        mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwnd_dc)
+        win32gui.DeleteObject(bmp.GetHandle())
+
         color = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
         gray  = cv2.cvtColor(raw, cv2.COLOR_BGRA2GRAY)
         return color, gray
