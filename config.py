@@ -95,6 +95,11 @@ THRESH_BATTLE_PLATFORM   = 0.60       # battle platform (UFO) detection
 THRESH_CLOCK             = 0.80       # cooldown clock icon
 THRESH_ARROWS            = 0.65       # craft arrow key detection
 
+# ─── Multi-Scale Matching ────────────────────────────────────────────────────
+# Scales to try when matching templates — covers smaller and larger screens
+# 1.0 = original size. Range goes from 50% to 150% of the template size.
+MATCH_SCALES             = [1.0, 0.9, 1.1, 0.8, 1.2, 0.7, 1.3, 0.6, 1.4, 0.5, 1.5]
+
 # ─── Vision / Detection ─────────────────────────────────────────────────────
 
 # Green fireball HSV colour range  [H, S, V]

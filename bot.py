@@ -96,6 +96,13 @@ class Bot:
             log.warn("Discord window not found — will retry")
         time.sleep(cfg.WINDOW_SETTLE_DELAY)
 
+        # Calibrate template scale to current screen/window size (one-time)
+        rect = self._get_rect()
+        if rect:
+            log.system("Calibrating templates to screen")
+            _, gray = self.vision.capture(rect)
+            self.vision.calibrate(gray)
+
         log.separator()
         log.system("Bot is now running")
         log.separator()

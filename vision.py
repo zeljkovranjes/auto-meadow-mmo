@@ -37,6 +37,7 @@ class GameVision:
         self.sct = mss.mss()
         self.templates: dict[str, np.ndarray] = {}
         self.arrow_templates: dict[str, np.ndarray] = {}
+        self._scale = 1.0  # detected at calibration
         self._load_templates()
         self._extract_arrow_templates()
 
@@ -72,6 +73,58 @@ class GameVision:
         if len(self.arrow_templates) < 4:
             log.warn("Not all arrow templates loaded — craft detection may fail")
 
+    # ── Calibration — run once to find the right scale ────────────────────
+
+    def calibrate(self, gray: np.ndarray):
+        """Try all scales against a few key templates, lock in the best one."""
+        test_keys = [k for k in ('craft_btn', 'battle_btn', 'adventure_btn',
+                                  'cooldown_clock', 'back_arrow')
+                     if k in self.templates]
+        if not test_keys:
+            return
+
+        best_scale, best_val = 1.0, -1
+        for scale in cfg.MATCH_SCALES:
+            total = 0
+            for key in test_keys:
+                tmpl = self.templates[key]
+                scaled = self._resize(tmpl, scale)
+                if scaled is None:
+                    continue
+                th, tw = scaled.shape[:2]
+                if gray.shape[0] < th or gray.shape[1] < tw:
+                    continue
+                res = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
+                _, val, _, _ = cv2.minMaxLoc(res)
+                total += val
+            if total > best_val:
+                best_val = total
+                best_scale = scale
+
+        self._scale = best_scale
+        if best_scale != 1.0:
+            log.system(f"Calibrated scale: {best_scale:.1f}x")
+            # Pre-scale all templates so every future match is single-pass
+            for key, tmpl in self.templates.items():
+                scaled = self._resize(tmpl, best_scale)
+                if scaled is not None:
+                    self.templates[key] = scaled
+            for direction, tmpl in self.arrow_templates.items():
+                scaled = self._resize(tmpl, best_scale)
+                if scaled is not None:
+                    self.arrow_templates[direction] = scaled
+        else:
+            log.system("Calibrated scale: 1.0x (native)")
+
+    def _resize(self, tmpl: np.ndarray, scale: float) -> np.ndarray | None:
+        if scale == 1.0:
+            return tmpl
+        h, w = tmpl.shape[:2]
+        new_w, new_h = int(w * scale), int(h * scale)
+        if new_w < 4 or new_h < 4:
+            return None
+        return cv2.resize(tmpl, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
     # ── Capture ───────────────────────────────────────────────────────────
 
     def capture(self, rect: tuple) -> tuple[np.ndarray, np.ndarray]:
@@ -83,10 +136,10 @@ class GameVision:
         gray  = cv2.cvtColor(raw, cv2.COLOR_BGRA2GRAY)
         return color, gray
 
-    # ── Template matching ─────────────────────────────────────────────────
+    # ── Template matching (single-pass, uses pre-scaled templates) ────────
 
     def find(self, gray: np.ndarray, key: str, thresh: float = 0.75):
-        """Brightness-invariant match (TM_CCOEFF_NORMED). Good for most templates."""
+        """Brightness-invariant match (TM_CCOEFF_NORMED)."""
         tmpl = self.templates.get(key)
         if tmpl is None or gray is None:
             return None
