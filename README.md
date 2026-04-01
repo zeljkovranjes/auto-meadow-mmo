@@ -30,16 +30,19 @@ pip install opencv-python numpy mss pywin32 pynput colorama
 
 ## Usage
 
-1. Open Discord and navigate to the Meadow MMO game
-2. Make sure the craft, battle, and adventure buttons are visible on screen
-3. Run the bot:
+1. Open a terminal **as Administrator** (right-click → Run as administrator)
+2. Open Discord and navigate to the Meadow MMO game
+3. Make sure the craft, battle, and adventure buttons are visible on screen
+4. Run the bot:
 
 ```bash
 python bot.py
 ```
 
-4. You have 3 seconds to switch back to the Discord window
-5. Press **F** to stop at any time
+5. You have 3 seconds to switch back to the Discord window
+6. Press **F** to stop at any time
+
+> **Note:** Running as Administrator is required for the bot to control your mouse and keyboard over Discord.
 
 ## Config
 
