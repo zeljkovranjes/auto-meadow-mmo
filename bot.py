@@ -152,9 +152,24 @@ class Bot:
                 if in_battle_game or in_craft_game:
                     return
 
+                # Try to dismiss any popup (out of resources, etc.)
+                # Press Escape first — catches any popup
+                log.warn("No activity buttons detected — pressing Escape")
+                self.ctrl.press_key('esc')
+                time.sleep(0.5)
+
+                # Also try clicking the out_of_resources button if visible
+                oor_btn = self.vision.find(gray, 'out_of_resources_btn')
+                if oor_btn:
+                    log.info("BOT", "Found dismiss button — clicking")
+                    self.ctrl.click(oor_btn[0], oor_btn[1])
+                    time.sleep(0.5)
+
+                # Then try back arrow
+                _, gray = self.vision.capture()
                 back = self.vision.find(gray, 'back_arrow')
                 if back:
-                    log.warn("No activity buttons detected — navigating back")
+                    log.warn("Clicking back arrow")
                     self.ctrl.click(back[0], back[1])
                     time.sleep(cfg.BACK_ARROW_DELAY)
                 return
@@ -238,6 +253,10 @@ class Bot:
                 time.sleep(cfg.CRAFT_LOAD_DELAY)
                 _, gray = self.vision.capture()
 
+                # Check for out-of-resources right after clicking
+                if self._check_oor(gray):
+                    return
+
         log.info("CRAFT", "Craft loop active — awaiting arrows")
 
         while not self._stop.is_set():
@@ -272,7 +291,24 @@ class Bot:
             else:
                 time.sleep(cfg.MAIN_LOOP_INTERVAL)
 
-    # ── Out-of-resources dismissal ────────────────────────────────────────
+    # ── Out-of-resources check + dismiss ─────────────────────────────────
+
+    def _check_oor(self, gray) -> bool:
+        """Check for out-of-resources popup. If found, dismiss it and
+        reset to IDLE. Returns True if popup was found."""
+        if self.vision.find(gray, 'out_of_resources'):
+            self._dismiss_out_of_resources(gray)
+            self.state = State.IDLE
+            return True
+        # Also check for the dismiss button alone (popup might look different)
+        oor_btn = self.vision.find(gray, 'out_of_resources_btn')
+        if oor_btn:
+            log.obstacle("Out-of-resources button detected — dismissing")
+            self.ctrl.press_key('esc')
+            time.sleep(0.5)
+            self.state = State.IDLE
+            return True
+        return False
 
     def _dismiss_out_of_resources(self, gray):
         log.obstacle("Obstacle detected — out of resources — circumventing")
@@ -319,6 +355,11 @@ class Bot:
             for _ in range(poll_iters):
                 time.sleep(cfg.BATTLE_LOAD_POLL)
                 color, gray = self.vision.capture()
+
+                # Check for out-of-resources popup during load
+                if self._check_oor(gray):
+                    return
+
                 if self.vision.find(gray, 'battle_btn', thresh=cfg.THRESH_BATTLE_BTN) is None:
                     break
 
